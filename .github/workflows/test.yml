@@ -1,0 +1,29 @@
+# The unit suite needs no container engine and no install: `tests/conftest.py` binds the checkout
+# to the `sandbox` name, because the repo root IS the package and no parent directory spells it.
+# The live suite needs a served sandbox and is run against one by hand -- see README.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install "pytest>=8" "coverage>=7" "ray[default,serve]"
+      - name: unit cases, from a bare checkout
+        run: python -m pytest -q -m "not live"
+      - name: coverage of the package
+        run: |
+          python -m coverage run --source=. -m pytest -q -m "not live"
+          python -m coverage report --include='service.py,runtime.py,route.py,__init__.py'

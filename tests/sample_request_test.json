@@ -1,0 +1,830 @@
+{
+  "directives": {
+    "repeat": "[text, count] -- expands to text * count, so the file stays readable",
+    "concat": "[part, ...] -- expands to the parts joined, each part expanded first"
+  },
+  "requires_env": "A case may name server settings it needs, as an upper bound the server must be configured AT OR BELOW. `build-runs-for-ever` cannot be run against a default server: ZERO_BUILD_TIMEOUT_S is 7200, so the case would hold a build slot for two hours -- which is the danger it exists to describe.",
+  "note": "Complete POST /execute bodies. Each is a thing a submitted runtime could do to the SERVICE rather than to itself. `session_id` is replaced per run. Every case must leave GET /health answering afterwards -- that assertion is the point of the file.",
+  "route": "POST /execute",
+  "expect_keys": {
+    "status": "the HTTP status the gateway must answer with",
+    "status_in": "any of these statuses is acceptable; the survival check is the assertion",
+    "error_prefix": "the error must start with this; the prefix IS the status contract",
+    "returncode_nonzero": "the action must not have succeeded",
+    "timed_out": "the action must have hit timeout_s",
+    "not_timed_out": "it must have died of its limit, not of the clock",
+    "not_alive": "the session must have been destroyed",
+    "signal": "the signal the kernel used, so the case names WHICH limit bound it",
+    "max_workspace_mb": "files.bytes_used must not exceed this",
+    "over_quota": "the workspace grant (bytes OR inodes) must have been found exceeded",
+    "max_retained_kb": "stdout_bytes and stderr_bytes must not exceed this",
+    "min_total_mb": "stdout_total_bytes must show the stream really was that large",
+    "stdout_int_at_most": "stdout read as an integer must not exceed this"
+  },
+  "cases": [
+    {
+      "name": "workspace-fills-the-node",
+      "danger": "workdir_gb is enforced as a per-file `fsize` ulimit, not as a quota. Files that each stay under it fill the node's compute-local scratch, and the service dies with the disk it keeps its image store and every workspace on. The grant is a CEILING here, not a barrier: the workspace is sampled and the container removed when it is passed, so the overshoot is one sampling interval of write bandwidth and no more. A true barrier needs a quota on the filesystem itself -- XFS project quota on the scratch directory -- because a bind mount takes no size from the engine.",
+      "slow": true,
+      "requires_env": {
+        "ZERO_WORKDIR_POLL_S": 1
+      },
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "for i in $(seq 1 8); do dd if=/dev/zero of=f$i bs=1M count=100 status=none || exit 0; done",
+        "cwd": "/work",
+        "timeout_s": 180,
+        "wait_s": 60,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "over_quota": true,
+        "not_alive": true,
+        "max_workspace_mb": 1024
+      }
+    },
+    {
+      "name": "single-file-exceeds-the-grant",
+      "danger": "One file larger than the grant. The `fsize` ulimit is what stops this one.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "dd if=/dev/zero of=fill bs=1M count=512 status=none; rc=$?; exit $rc",
+        "cwd": "/work",
+        "timeout_s": 120,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "returncode_nonzero": true,
+        "signal": 25,
+        "max_workspace_mb": 300
+      }
+    },
+    {
+      "name": "inode-bomb",
+      "danger": "Empty files carry no bytes, so a byte quota never sees them -- but they still consume inodes, and exhausting the filesystem's inode table fails every write on the node. The workspace ceiling counts inodes, not only bytes.",
+      "slow": true,
+      "requires_env": {
+        "ZERO_WORKDIR_MAX_FILES": 50000,
+        "ZERO_WORKDIR_POLL_S": 1
+      },
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "i=0; while [ $i -lt 60000 ]; do : > f$i; i=$((i+1)); done; echo MADE_$i",
+        "cwd": "/work",
+        "timeout_s": 180,
+        "wait_s": 60,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "over_quota": true,
+        "not_alive": true
+      }
+    },
+    {
+      "name": "ram-workspace-must-be-charged-to-memory",
+      "danger": "A tmpfs workspace IS memory. If workdir_gb were not added to the container's memory limit, filling it would be a node-wide memory attack that the session's own --memory never sees.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "dd if=/dev/zero of=fill bs=1M count=900 status=none; rc=$?; exit $rc",
+        "cwd": "/work",
+        "timeout_s": 120,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.5,
+          "workdir_medium": "ram",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "returncode_nonzero": true
+      }
+    },
+    {
+      "name": "tmp-tmpfs-bomb",
+      "danger": "/tmp is a 256 MiB tmpfs, which is RAM. An uncapped one is a node memory attack.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "dd if=/dev/zero of=/tmp/fill bs=1M count=512 status=none; du -sm /tmp | cut -f1",
+        "cwd": "/work",
+        "timeout_s": 120,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "stdout_int_at_most": 300
+      }
+    },
+    {
+      "name": "dev-shm-tmpfs-bomb",
+      "danger": "/dev/shm is a 256 MiB tmpfs, and is RAM for the same reason.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "dd if=/dev/zero of=/dev/shm/f bs=1M count=512 status=none; du -sm /dev/shm | cut -f1",
+        "cwd": "/work",
+        "timeout_s": 120,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "stdout_int_at_most": 300
+      }
+    },
+    {
+      "name": "fork-bomb",
+      "danger": "A recursive fork bomb. Without a PID limit it exhausts the node's process table, and then nothing on the node can fork again -- the service included.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "b() { b | b & }; b; echo DONE",
+        "cwd": "/work",
+        "timeout_s": 20,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200
+      }
+    },
+    {
+      "name": "pid-exhaustion",
+      "danger": "The same attack written plainly, to test the limit rather than the shell.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "for i in $(seq 1 400); do sleep 30 & done; wait",
+        "cwd": "/work",
+        "timeout_s": 30,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "returncode_nonzero": true
+      }
+    },
+    {
+      "name": "memory-bomb",
+      "danger": "Allocate past the grant. The cgroup must kill the process, not the node.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "dd if=/dev/zero of=/dev/null bs=1500M count=1; rc=$?; exit $rc",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "returncode_nonzero": true,
+        "signal": 9,
+        "not_timed_out": true
+      }
+    },
+    {
+      "name": "cpu-spin",
+      "danger": "An action that never returns. Wall time is the only thing that ends it.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "while :; do :; done",
+        "cwd": "/work",
+        "timeout_s": 5,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "timed_out": true,
+        "not_alive": true
+      }
+    },
+    {
+      "name": "stdout-firehose",
+      "danger": "Half a gigabyte through the reply. io_cap_kb bounds what is RETAINED; the service must not buffer the rest, and must still answer.",
+      "slow": true,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "yes xxxxxxxxxxxxxxxx | head -c 536870912 2>/dev/null",
+        "cwd": "/work",
+        "timeout_s": 180,
+        "wait_s": 0,
+        "io_cap_kb": 64,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "max_retained_kb": 64,
+        "min_total_mb": 256
+      }
+    },
+    {
+      "name": "stderr-firehose",
+      "danger": "The same on the other stream: each is drained by its own reader thread.",
+      "slow": true,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "yes xxxxxxxxxxxxxxxx | head -c 268435456 2>/dev/null >&2",
+        "cwd": "/work",
+        "timeout_s": 180,
+        "wait_s": 0,
+        "io_cap_kb": 64,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 200,
+        "max_retained_kb": 64
+      }
+    },
+    {
+      "name": "build-runs-for-ever",
+      "danger": "A build with no end. ZERO_BUILD_TIMEOUT_S is what stops it holding a build slot for the life of the service.",
+      "slow": true,
+      "requires_env": {
+        "ZERO_BUILD_TIMEOUT_S": 300
+      },
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\nRUN while :; do :; done\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 503,
+        "error_prefix": "unavailable:"
+      }
+    },
+    {
+      "name": "build-writes-a-huge-layer",
+      "danger": "A build that fills the image store. The build limits are what bound it.",
+      "slow": true,
+      "requires_env": {
+        "ZERO_BUILD_TIMEOUT_S": 300,
+        "ZERO_BUILD_DISK_GB": 4
+      },
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\nRUN dd if=/dev/zero of=/big bs=1M count=100000\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 503,
+        "error_prefix": "unavailable:"
+      }
+    },
+    {
+      "name": "build-forks-without-limit",
+      "danger": "A fork bomb inside the BUILD rather than inside the session. `b | b &` returns as soon as it has backgrounded itself, so the RUN may well SUCCEED and the image be built -- what must not happen is the node running out of processes, which is what the build's own nproc ulimit is for. Either status is a pass; the health check is not.",
+      "slow": true,
+      "requires_env": {
+        "ZERO_BUILD_TIMEOUT_S": 300
+      },
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\nRUN b() { b | b & }; b\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status_in": [
+          200,
+          503
+        ]
+      }
+    },
+    {
+      "name": "oversized-dockerfile",
+      "danger": "A declaration over the cap is held in memory once per remembered runtime.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": {
+            "concat": [
+              "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+              "# ",
+              {
+                "repeat": [
+                  "x",
+                  262144
+                ]
+              },
+              "\n"
+            ]
+          },
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    },
+    {
+      "name": "oversized-documentation",
+      "danger": "Served metadata is echoed by /health for every remembered runtime.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": {
+            "repeat": [
+              "y",
+              262145
+            ]
+          }
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    },
+    {
+      "name": "too-many-environment-entries",
+      "danger": "Request-scoped environment is written into the session's control mount.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        },
+        "env": {
+          "K0": "v",
+          "K1": "v",
+          "K2": "v",
+          "K3": "v",
+          "K4": "v",
+          "K5": "v",
+          "K6": "v",
+          "K7": "v",
+          "K8": "v",
+          "K9": "v",
+          "K10": "v",
+          "K11": "v",
+          "K12": "v",
+          "K13": "v",
+          "K14": "v",
+          "K15": "v",
+          "K16": "v",
+          "K17": "v",
+          "K18": "v",
+          "K19": "v",
+          "K20": "v",
+          "K21": "v",
+          "K22": "v",
+          "K23": "v",
+          "K24": "v",
+          "K25": "v",
+          "K26": "v",
+          "K27": "v",
+          "K28": "v",
+          "K29": "v",
+          "K30": "v",
+          "K31": "v",
+          "K32": "v",
+          "K33": "v",
+          "K34": "v",
+          "K35": "v",
+          "K36": "v",
+          "K37": "v",
+          "K38": "v",
+          "K39": "v",
+          "K40": "v",
+          "K41": "v",
+          "K42": "v",
+          "K43": "v",
+          "K44": "v",
+          "K45": "v",
+          "K46": "v",
+          "K47": "v",
+          "K48": "v",
+          "K49": "v",
+          "K50": "v",
+          "K51": "v",
+          "K52": "v",
+          "K53": "v",
+          "K54": "v",
+          "K55": "v",
+          "K56": "v",
+          "K57": "v",
+          "K58": "v",
+          "K59": "v",
+          "K60": "v",
+          "K61": "v",
+          "K62": "v",
+          "K63": "v",
+          "K64": "v"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    },
+    {
+      "name": "oversized-environment",
+      "danger": "The same by total size rather than by count.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        },
+        "env": {
+          "BIG": {
+            "repeat": [
+              "x",
+              131073
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    },
+    {
+      "name": "impossible-cpu-grant",
+      "danger": "A grant larger than admission must be refused at once, never queued for ever.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 4096,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    },
+    {
+      "name": "timeout-beyond-the-server-maximum",
+      "danger": "The caller does not choose how long the server will run one action.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 1000000000,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    },
+    {
+      "name": "idle-beyond-the-server-maximum",
+      "danger": "Nor how long an idle session may sit on its grant.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/work",
+        "timeout_s": 60,
+        "wait_s": 1000000000,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    },
+    {
+      "name": "escape-the-working-directory",
+      "danger": "cwd is the one path the caller names.",
+      "slow": false,
+      "requires_env": {},
+      "request": {
+        "runtime": {
+          "dockerfile": "FROM docker.io/library/alpine:latest\nENV ZERO_RUNTIME_SHELL=/bin/sh\n",
+          "documentation": ""
+        },
+        "session_id": "REPLACED-PER-RUN",
+        "code": "true",
+        "cwd": "/etc",
+        "timeout_s": 60,
+        "wait_s": 0,
+        "io_cap_kb": 200,
+        "resources": {
+          "cpus": 1,
+          "memory_gb": 1,
+          "workdir_gb": 0.25,
+          "workdir_medium": "temp",
+          "gpus": 0,
+          "pids": 64
+        }
+      },
+      "expect": {
+        "status": 400,
+        "error_prefix": "bad_request:"
+      }
+    }
+  ]
+}

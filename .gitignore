@@ -1,0 +1,12 @@
+.toolchain/
+.image-store/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage*
+htmlcov/
+*.egg-info/
+dist/
+build/
+.venv/
+REMAINING.md

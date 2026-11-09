@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "http-sandbox"
+version = "0.1.0"
+description = "A blind, resource-bounded HTTP service for submitted container runtimes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Nguyen Minh Quang"}]
+keywords = ["sandbox", "code-execution", "containers", "podman", "ray", "http"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/nbtpj/zero-sandbox"
+Issues = "https://github.com/nbtpj/zero-sandbox/issues"
+
+[project.scripts]
+http-sandbox = "sandbox.service:main"
+
+[project.optional-dependencies]
+server = ["ray[default,serve]"]
+dev = ["pytest>=8", "coverage>=7"]
+
+# The checkout root IS the package: the submodule is mounted at `sandbox/` in a consumer, so
+# `from sandbox.service import ...` must work from a checkout and from a wheel alike.
+[tool.setuptools]
+packages = ["sandbox"]
+package-dir = {sandbox = "."}
+
+# `policy.json` and `egress/Dockerfile` are READ AT RUNTIME from the package directory
+# (`service.py` `_HERE`). Without this a wheel installs three .py files, endpoint egress raises
+# FileNotFoundError, and CONTAINERS_POLICY points at a path that does not exist.
+[tool.setuptools.package-data]
+sandbox = ["policy.json", "egress/Dockerfile", "canary/Dockerfile", "build.sh", "launch-server.sh"]
+
+[tool.pytest.ini_options]
+# The package root holds `__init__.py`; without this pytest collects it as a test module.
+testpaths = ["tests"]
+# An unknown mark or an unregistered ini key is a typo that would otherwise silently skip nothing.
+addopts = "--strict-markers --strict-config"
+markers = ["live: needs a served sandbox in ZERO_SANDBOX_URL",
+           "slow: costs real minutes -- builds that never end, gigabyte streams"]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
